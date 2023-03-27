@@ -8,48 +8,46 @@ from torch.optim import RMSprop
 vf_coef = 1.0
 class LIIRLearner:
     def __init__(self, mac, scheme, logger, args):
+        """Initialize the learner class"""
         self.args = args
         self.n_agents = args.n_agents
         self.n_actions = args.n_actions
         self.mac = mac
         self.logger = logger
-
         self.last_target_update_step = 0
         self.critic_training_steps = 0
-
         self.log_stats_t = -self.args.learner_log_interval - 1
-
+        # Initialize critic network
         self.critic = LIIRCritic(scheme, args)
         self.target_critic = copy.deepcopy(self.critic)
-
+        # Initialize policy networks
         self.policy_new = copy.deepcopy(self.mac)
         self.policy_old = copy.deepcopy(self.mac)
-
+        # Move networks to GPU or CPU
         if self.args.use_cuda:
-            # following two lines should be used when use GPU 
             self.policy_old.agent = self.policy_old.agent.to("cuda")
             self.policy_new.agent = self.policy_new.agent.to("cuda")
         else:
-            # following lines should be used when use CPU, 
             self.policy_old.agent = self.policy_old.agent.to("cpu")
             self.policy_new.agent = self.policy_new.agent.to("cpu")
-
+        # Define optimizers
         self.agent_params = list(mac.parameters())
         self.critic_params = list(self.critic.fc1.parameters()) + list(self.critic.fc2.parameters()) + list(
             self.critic.fc3_v_mix.parameters())
         self.intrinsic_params = list(self.critic.fc3_r_in.parameters()) + list(self.critic.fc4.parameters())  # to do
         self.params = self.agent_params + self.critic_params + self.intrinsic_params
-
         self.agent_optimiser = RMSprop(params=self.agent_params, lr=args.lr, alpha=args.optim_alpha, eps=args.optim_eps)
         self.critic_optimiser = RMSprop(params=self.critic_params, lr=args.critic_lr, alpha=args.optim_alpha,
                                         eps=args.optim_eps)
         self.intrinsic_optimiser = RMSprop(params=self.intrinsic_params, lr=args.critic_lr, alpha=args.optim_alpha,
                                            eps=args.optim_eps)  # should distinguish them
+        # Initialize counters
         self.update = 0
         self.count = 0
 
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int, nupdate: int):
         # Get the relevant quantities
+        # 这里应该就是在获取 batch 输入数据
         bs = batch.batch_size
         max_t = batch.max_seq_length
         rewards = batch["reward"][:, :-1]
@@ -67,12 +65,12 @@ class LIIRLearner:
         avail_actions1 = avail_actions.reshape(-1, self.n_agents, self.n_actions)  # [maskxx,:]
         mask_alive = 1.0 - avail_actions1[:, :, 0]
         mask_alive = mask_alive.float()
-
+        # 这里怎么就在 train Critic 网络了呢？
         q_vals, critic_train_stats, target_mix, target_ex, v_ex, r_in = self._train_critic(batch, rewards, terminated,                                                                                        actions, avail_actions,
                                                                                            critic_mask, bs, max_t)
 
         actions = actions[:, :-1]
-
+        # 这里是让 agent 重新采样一个 action、状态的轨迹
         mac_out = []
         self.mac.init_hidden(batch.batch_size)
         for t in range(batch.max_seq_length - 1):
@@ -90,18 +88,20 @@ class LIIRLearner:
         # Calculate policy grad with mask
         pi_taken = th.gather(pi, dim=1, index=actions.reshape(-1, 1)).squeeze(1)
         pi_taken[mask_long.squeeze(-1) == 0] = 1.0
+        # 这里在计算 log \pi(a|s)
         log_pi_taken = th.log(pi_taken)
-
+        # 计算 Agent 的优势函数
         advantages = (target_mix.reshape(-1, 1) - q_vals).detach()
+        # 这里还做了归一化？
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         log_pi_taken = log_pi_taken.reshape(-1, self.n_agents)
         log_pi_taken = log_pi_taken * mask_alive
         log_pi_taken = log_pi_taken.reshape(-1, 1)
-
+        # Agent 的 loss
         liir_loss = - ((advantages * log_pi_taken) * mask_long).sum() / mask_long.sum()
 
-        # Optimise agents
+        # Optimise agents 更新 Agent 的 Loss
         self.agent_optimiser.zero_grad()
         liir_loss.backward()
         grad_norm_policy = th.nn.utils.clip_grad_norm_(self.agent_params, self.args.grad_norm_clip)
@@ -109,9 +109,12 @@ class LIIRLearner:
 
         # _________Intrinsic loss optimizer --------------------
         # ____value loss
+        # 这里应该是 external reward 的平方误差，用于 update external value 的预测值
+        # 只是它把这个 update 和 intrinsic reward 的 update 混合到了一起。
         v_ex_loss = (((v_ex - target_ex.detach()) ** 2).view(-1, 1) * mask).sum() / mask.sum()
 
         # _____pg1____
+        # 这里计算agent更新前的 Policy Gradient
         mac_out_old = []
         self.policy_old.init_hidden(batch.batch_size)
         for t in range(batch.max_seq_length - 1):
@@ -131,6 +134,7 @@ class LIIRLearner:
         log_pi_taken_old = th.log(pi_taken_old)
 
         log_pi_taken_old = log_pi_taken_old.reshape(-1, self.n_agents)
+        # Policy Gradient 就是 log \pi(a|s)
         log_pi_taken_old = log_pi_taken_old * mask_alive
 
         # ______pg2___new pi theta
@@ -157,10 +161,11 @@ class LIIRLearner:
         log_pi_taken_new = log_pi_taken_new.reshape(-1, self.n_agents)
         log_pi_taken_new = log_pi_taken_new * mask_alive
         neglogpac_new = - log_pi_taken_new.sum(-1)
-
+        # 这里是旧 policy(self.mac) 第一次采样的 log_pi
         pi2 = log_pi_taken.reshape(-1, self.n_agents).sum(-1).clone()
-        ratio_new = th.exp(- pi2 - neglogpac_new)  
-        
+        # 这里是在干嘛？就是 resuing samples 的技术，那个与优势函数相乘的系数
+        ratio_new = th.exp(- pi2 - neglogpac_new)
+        # 外部奖励的优势函数？
         adv_ex = (target_ex - v_ex.detach()).detach()
         adv_ex = (adv_ex - adv_ex.mean()) / (adv_ex.std() + 1e-8)
 
@@ -168,26 +173,27 @@ class LIIRLearner:
         mask_tnagt = critic_mask.repeat(1, 1, self.n_agents)
 
         pg_loss1 = (log_pi_taken_old.view(-1, 1) * mask_long).sum() / mask_long.sum()
+        # 这里是公式 8 也就是公式 7 的第一部分
         pg_loss2 = ((adv_ex.view(-1) * ratio_new) * mask.squeeze(-1)).sum() / mask.sum()
         self.policy_old.agent.zero_grad()
         pg_loss1_grad = th.autograd.grad(pg_loss1, self.policy_old.parameters())
 
         self.policy_new.agent.zero_grad()
         pg_loss2_grad = th.autograd.grad(pg_loss2, self.policy_new.parameters())
-
+        # 这里是 resuing samples 的技术？
         grad_total = 0
         for grad1, grad2 in zip(pg_loss1_grad, pg_loss2_grad):
             grad_total += (grad1 * grad2).sum()
 
         target_mix = target_mix.reshape(-1, max_t - 1, self.n_agents)
-        pg_ex_loss = ((grad_total.detach() * target_mix) * mask_tnagt).sum() / mask_tnagt.sum()  
-
+        pg_ex_loss = ((grad_total.detach() * target_mix) * mask_tnagt).sum() / mask_tnagt.sum()
+        # 所以这里 pg_ex_loss 应该是公式 7 而 v_ex_loss 就是 ex_v 的 Critic 网络的损失，只是结合到一起来 update 了。
         intrinsic_loss = pg_ex_loss + vf_coef * v_ex_loss
         self.intrinsic_optimiser.zero_grad()
         intrinsic_loss.backward()
 
         self.intrinsic_optimiser.step()
-            
+
         self._update_policy_piold()
 
         # ______config tensorboard
@@ -212,9 +218,11 @@ class LIIRLearner:
             self.log_stats_t = t_env
 
     def _train_critic(self, batch, rewards, terminated, actions, avail_actions, mask, bs, max_t):
+        # 那这里就是在 update mix Critic 的预测输出的正确性，基于 TD 算法
         # Optimise critic
+        # 目标网络
         r_in, target_vals, target_val_ex = self.target_critic(batch)
-
+        # 当前网络
         r_in, _, target_val_ex_opt = self.critic(batch)
         r_in_taken = th.gather(r_in, dim=3, index=actions)
         r_in = r_in_taken.squeeze(-1)
@@ -239,7 +247,8 @@ class LIIRLearner:
             mask_t = mask[:, t].expand(-1, self.n_agents)
             if mask_t.sum() == 0:
                 continue
-
+            # critic 网络的三个返回值分别是：r_in, v_mix, v_ex 内部奖励、混合奖励、外部奖励对应的价值函数预估值
+            # 都是线性层预测的
             _, q_t, _ = self.critic(batch, t)  # 8,1,3,1,
             vals_mix[:, t] = q_t.view(bs, self.n_agents)
             targets_t = targets_mix[:, t]
