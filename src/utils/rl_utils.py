@@ -3,6 +3,12 @@ import pdb
 
 
 def build_td_lambda_targets(rewards, terminated, mask, target_qs, n_agents, gamma, td_lambda, r_in, v_ex):
+    """
+    rewards: 外部奖励
+    target_qs: target_critic 预测的 mix value
+    r_in: critic 预测的 r_in
+    v_ex: target critic 预测的 v_ex
+    """
     # Assumes  <target_qs > in B*T*A and <reward >, <terminated >, <mask > in (at least) B*T-1*1
     # Initialise  last  lambda -return  for  not  terminated  episodes
     # td_lambda = 1

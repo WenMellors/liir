@@ -109,6 +109,7 @@ class LIIRLearner:
 
         # _________Intrinsic loss optimizer --------------------
         # ____value loss
+        # MSE loss
         v_ex_loss = (((v_ex - target_ex.detach()) ** 2).view(-1, 1) * mask).sum() / mask.sum()
 
         # _____pg1____
@@ -225,6 +226,7 @@ class LIIRLearner:
                                                           self.args.gamma, self.args.td_lambda, r_in, target_val_ex)
 
         vals_mix = th.zeros_like(target_vals)[:, :-1]
+        # 为什么这里要把最后一个时间步的值去掉呢？
         vals_ex = target_val_ex_opt[:, :-1]
 
         running_log = {
@@ -263,7 +265,7 @@ class LIIRLearner:
             running_log["td_error_abs"].append((masked_td_error.abs().sum().item() / mask_elems))
             running_log["value_mean"].append((q_t.view(bs, self.n_agents) * mask_t).sum().item() / mask_elems)
             running_log["target_mean"].append((targets_t * mask_t).sum().item() / mask_elems)
-
+        # 这里的 vals_ex 需要记录梯度
         return vals_mix, running_log, targets_mix, targets_ex, vals_ex, r_in
 
     def _update_targets(self):
